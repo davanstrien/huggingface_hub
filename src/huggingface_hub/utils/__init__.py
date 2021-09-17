@@ -13,3 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License
+
+import subprocess
+
+
+def run_subprocess(command, folder, check=True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        command,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        check=check,
+        encoding="utf-8",
+        cwd=folder,
+    )

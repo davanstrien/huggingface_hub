@@ -16,7 +16,7 @@ from huggingface_hub.repocard import metadata_load, metadata_save
 
 from .hf_api import ENDPOINT, HfApi, HfFolder, repo_type_and_id_from_hf_id
 from .lfs import LFS_MULTIPART_UPLOAD_COMMAND
-from .utils import logging
+from .utils import logging, run_subprocess
 
 
 logger = logging.get_logger(__name__)
@@ -86,17 +86,6 @@ class CommandInProgress:
         return f"[{self.title} command, status code: {status}, {'in progress.' if not self.is_done else 'finished.'} PID: {self._process.pid}]"
 
 
-def run_subprocess(command, folder, check=True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        command.split(),
-        stderr=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        check=check,
-        encoding="utf-8",
-        cwd=folder,
-    )
-
-
 def is_git_repo(folder: Union[str, Path]) -> bool:
     """
     Check if the folder is the root of a git repository
@@ -115,7 +104,7 @@ def is_local_clone(folder: Union[str, Path], remote_url: str) -> bool:
     if not is_git_repo(folder):
         return False
 
-    remotes = run_subprocess("git remote -v", folder).stdout
+    remotes = run_subprocess("git remote -v".split(), folder).stdout
 
     # Remove token for the test with remotes.
     remote_url = re.sub(r"https://.*@", "https://", remote_url)
@@ -131,7 +120,7 @@ def is_tracked_with_lfs(filename: Union[str, Path]) -> bool:
     filename = Path(filename).name
 
     try:
-        p = run_subprocess(f"git check-attr -a {filename}", folder)
+        p = run_subprocess("git check-attr -a".split() + [filename], folder)
         attributes = p.stdout.strip()
     except subprocess.CalledProcessError as exc:
         if not is_git_repo(folder):
@@ -160,7 +149,7 @@ def is_git_ignored(filename: Union[str, Path]) -> bool:
     filename = Path(filename).name
 
     try:
-        p = run_subprocess(f"git check-ignore {filename}", folder, check=False)
+        p = run_subprocess("git check-ignore".split() + [filename], folder, check=False)
         # Will return exit code 1 if not gitignored
         is_ignored = not bool(p.returncode)
     except subprocess.CalledProcessError as exc:
@@ -171,7 +160,7 @@ def is_git_ignored(filename: Union[str, Path]) -> bool:
 
 def files_to_be_staged(pattern: str, folder: Union[str, Path]) -> List[str]:
     try:
-        p = run_subprocess(f"git ls-files -mo {pattern}", folder)
+        p = run_subprocess(f"git ls-files -mo {pattern}".split(), folder)
         if len(p.stdout.strip()):
             files = p.stdout.strip().split("\n")
         else:
@@ -187,7 +176,9 @@ def is_tracked_upstream(folder: Union[str, Path]) -> bool:
     Check if the current checked-out branch is tracked upstream.
     """
     try:
-        run_subprocess("git rev-parse --symbolic-full-name --abbrev-ref @{u}", folder)
+        run_subprocess(
+            "git rev-parse --symbolic-full-name --abbrev-ref @{u}".split(), folder
+        )
         return True
     except subprocess.CalledProcessError as exc:
         if "HEAD" in exc.stderr:
@@ -201,7 +192,7 @@ def commits_to_push(folder: Union[str, Path], upstream: Optional[str] = None) ->
     Check the number of commits that would be pushed upstream
     """
     try:
-        result = run_subprocess(f"git cherry -v {upstream or ''}", folder)
+        result = run_subprocess(f"git cherry -v {upstream or ''}".split(), folder)
         return len(result.stdout.split("\n")) - 1
     except subprocess.CalledProcessError as exc:
         raise EnvironmentError(exc.stderr)
@@ -415,7 +406,7 @@ class Repository:
         """
         try:
             result = run_subprocess(
-                "git rev-parse --abbrev-ref HEAD", self.local_dir
+                "git rev-parse --abbrev-ref HEAD".split(), self.local_dir
             ).stdout.strip()
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
@@ -427,7 +418,9 @@ class Repository:
         print git and git-lfs versions, raises if they aren't installed.
         """
         try:
-            git_version = run_subprocess("git --version", self.local_dir).stdout.strip()
+            git_version = run_subprocess(
+                "git --version".split(), self.local_dir
+            ).stdout.strip()
         except FileNotFoundError:
             raise EnvironmentError(
                 "Looks like you do not have git installed, please install."
@@ -435,7 +428,7 @@ class Repository:
 
         try:
             lfs_version = run_subprocess(
-                "git-lfs --version", self.local_dir
+                "git-lfs --version".split(), self.local_dir
             ).stdout.strip()
         except FileNotFoundError:
             raise EnvironmentError(
@@ -507,7 +500,9 @@ class Repository:
                 logger.warning(f"Cloning {clean_repo_url} into local empty directory.")
 
                 with lfs_log_progress():
-                    run_subprocess(f"git lfs clone {repo_url} .", self.local_dir)
+                    run_subprocess(
+                        f"git lfs clone {repo_url} .".split(), self.local_dir
+                    )
             else:
                 # Check if the folder is the root of a git repository
                 in_repository = is_git_repo(self.local_dir)
@@ -520,7 +515,9 @@ class Repository:
                         )
                     else:
                         output = run_subprocess(
-                            "git remote get-url origin", self.local_dir, check=False
+                            "git remote get-url origin".split(),
+                            self.local_dir,
+                            check=False,
                         )
 
                         error_msg = (
@@ -554,10 +551,14 @@ class Repository:
         """
         try:
             if git_user is not None:
-                run_subprocess(f"git config user.name {git_user}", self.local_dir)
+                run_subprocess(
+                    "git config user.name".split() + [git_user], self.local_dir
+                )
 
             if git_email is not None:
-                run_subprocess(f"git config user.email {git_email}", self.local_dir)
+                run_subprocess(
+                    f"git config user.email {git_email}".split(), self.local_dir
+                )
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
 
@@ -566,7 +567,7 @@ class Repository:
         sets the git credential helper to `store`
         """
         try:
-            run_subprocess("git config credential.helper store", self.local_dir)
+            run_subprocess("git config credential.helper store".split(), self.local_dir)
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
 
@@ -575,7 +576,7 @@ class Repository:
         Get commit sha on top of HEAD.
         """
         try:
-            p = run_subprocess("git rev-parse HEAD", self.local_dir)
+            p = run_subprocess("git rev-parse HEAD".split(), self.local_dir)
             return p.stdout.strip()
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
@@ -585,7 +586,9 @@ class Repository:
         Get URL to origin remote.
         """
         try:
-            p = run_subprocess("git config --get remote.origin.url", self.local_dir)
+            p = run_subprocess(
+                "git config --get remote.origin.url".split(), self.local_dir
+            )
             url = p.stdout.strip()
             # Strip basic auth info.
             return re.sub(r"https://.*@", "https://", url)
@@ -609,7 +612,9 @@ class Repository:
         Returns a list of the files that are deleted in the working directory or index.
         """
         try:
-            git_status = run_subprocess("git status -s", self.local_dir).stdout.strip()
+            git_status = run_subprocess(
+                "git status -s".split(), self.local_dir
+            ).stdout.strip()
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
 
@@ -652,7 +657,9 @@ class Repository:
             patterns = [patterns]
         try:
             for pattern in patterns:
-                cmd = f"git lfs track {'--filename' if filename else ''} {pattern}"
+                cmd = f"git lfs track {'--filename' if filename else ''}".split() + [
+                    pattern
+                ]
                 run_subprocess(cmd, self.local_dir)
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
@@ -665,7 +672,7 @@ class Repository:
             patterns = [patterns]
         try:
             for pattern in patterns:
-                run_subprocess(f"git lfs untrack {pattern}", self.local_dir)
+                run_subprocess("git lfs untrack".split() + [pattern], self.local_dir)
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
 
@@ -675,9 +682,10 @@ class Repository:
         """
         try:
             lfs_config = "git config lfs.customtransfer.multipart"
-            run_subprocess(f"{lfs_config}.path huggingface-cli", self.local_dir)
+            run_subprocess(f"{lfs_config}.path huggingface-cli".split(), self.local_dir)
             run_subprocess(
-                f"{lfs_config}.args {LFS_MULTIPART_UPLOAD_COMMAND}", self.local_dir
+                f"{lfs_config}.args {LFS_MULTIPART_UPLOAD_COMMAND}".split(),
+                self.local_dir,
             )
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
@@ -719,7 +727,7 @@ class Repository:
             command += " --rebase"
         try:
             with lfs_log_progress():
-                result = run_subprocess(command, self.local_dir)
+                result = run_subprocess(command.split(), self.local_dir)
                 logger.info(result.stdout)
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
@@ -741,7 +749,7 @@ class Repository:
                 )
 
         try:
-            result = run_subprocess(f"git add -v {pattern}", self.local_dir)
+            result = run_subprocess("git add -v".split() + [pattern], self.local_dir)
             logger.info(f"Adding to index:\n{result.stdout}\n")
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
@@ -751,7 +759,9 @@ class Repository:
         git commit
         """
         try:
-            result = run_subprocess("git commit -m {commit_message} -v", self.local_dir)
+            result = run_subprocess(
+                "git commit -v -m".split() + [commit_message], self.local_dir
+            )
             logger.info(f"Committed:\n{result.stdout}\n")
         except subprocess.CalledProcessError as exc:
             if len(exc.stderr) > 0:
@@ -851,7 +861,7 @@ class Repository:
         """
         command = f"git checkout {revision}"
         try:
-            result = run_subprocess(command, self.local_dir)
+            result = run_subprocess(command.split(), self.local_dir)
             logger.warning(f"Checked out {revision} from {self.current_branch}.")
             logger.warning(result.stdout)
         except subprocess.CalledProcessError as exc:
@@ -860,7 +870,7 @@ class Repository:
             else:
                 command = f"git checkout -b {revision}"
                 try:
-                    result = run_subprocess(command, self.local_dir)
+                    result = run_subprocess(command.split(), self.local_dir)
                     logger.warning(
                         f"Revision `{revision}` does not exist. Created and checked out branch `{revision}`."
                     )
@@ -875,7 +885,7 @@ class Repository:
         if remote:
             try:
                 result = run_subprocess(
-                    f"git ls-remote origin refs/tags/{tag_name}", self.local_dir
+                    f"git ls-remote origin refs/tags/{tag_name}".split(), self.local_dir
                 ).stdout.strip()
             except subprocess.CalledProcessError as exc:
                 raise EnvironmentError(exc.stderr)
@@ -883,7 +893,9 @@ class Repository:
             return len(result) != 0
         else:
             try:
-                git_tags = run_subprocess("git tag", self.local_dir).stdout.strip()
+                git_tags = run_subprocess(
+                    "git tag".split(), self.local_dir
+                ).stdout.strip()
             except subprocess.CalledProcessError as exc:
                 raise EnvironmentError(exc.stderr)
 
@@ -908,14 +920,16 @@ class Repository:
 
         if delete_locally:
             try:
-                run_subprocess(f"git tag -d {tag_name}", self.local_dir).stdout.strip()
+                run_subprocess(
+                    f"git tag -d {tag_name}".split(), self.local_dir
+                ).stdout.strip()
             except subprocess.CalledProcessError as exc:
                 raise EnvironmentError(exc.stderr)
 
         if remote and delete_remotely:
             try:
                 run_subprocess(
-                    "git push {remote} --delete {tag_name}", self.local_dir
+                    f"git push {remote} --delete {tag_name}".split(), self.local_dir
                 ).stdout.strip()
             except subprocess.CalledProcessError as exc:
                 raise EnvironmentError(exc.stderr)
@@ -937,14 +951,14 @@ class Repository:
             tag_args = f"git tag {tag_name}"
 
         try:
-            run_subprocess(tag_args, self.local_dir).stdout.strip()
+            run_subprocess(tag_args.split(), self.local_dir).stdout.strip()
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
 
         if remote:
             try:
                 run_subprocess(
-                    f"git push {remote} {tag_name}", self.local_dir
+                    f"git push {remote} {tag_name}".split(), self.local_dir
                 ).stdout.strip()
             except subprocess.CalledProcessError as exc:
                 raise EnvironmentError(exc.stderr)
@@ -955,7 +969,7 @@ class Repository:
         """
         try:
             git_status = run_subprocess(
-                "git status --porcelain", self.local_dir
+                "git status --porcelain".split(), self.local_dir
             ).stdout.strip()
         except subprocess.CalledProcessError as exc:
             raise EnvironmentError(exc.stderr)
