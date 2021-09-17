@@ -318,13 +318,17 @@ class HfApi:
         write_to_credential_store(username, password)
         return d["token"]
 
-    def whoami(self, token: str) -> Dict:
+    def whoami(self, token: Optional[str]) -> Dict:
         """
         Call HF API to know "whoami".
 
         Args:
             token (``str``): Hugging Face token.
         """
+
+        if token is None:
+            token = HfFolder.get_token()
+
         path = "{}/api/whoami-v2".format(self.endpoint)
         r = requests.get(path, headers={"authorization": "Bearer {}".format(token)})
         r.raise_for_status()
@@ -824,3 +828,15 @@ class HfFolder:
             os.remove(cls.path_token)
         except FileNotFoundError:
             pass
+
+
+api = HfApi()
+
+login = api.login
+logout = api.logout
+list_models = api.list_models
+list_datasets = api.list_datasets
+create_repo = api.create_repo
+delete_repo = api.delete_repo
+update_repo_visibility = api.update_repo_visibility
+upload_file = api.upload_file
