@@ -2,6 +2,7 @@ import os
 import shutil
 import time
 import unittest
+import uuid
 
 from huggingface_hub import HfApi
 from huggingface_hub.file_download import is_torch_available
@@ -11,7 +12,7 @@ from .testing_constants import ENDPOINT_STAGING, PASS, USER
 from .testing_utils import set_write_permission_and_retry
 
 
-REPO_NAME = "mixin-repo-{}".format(int(time.time() * 10e3))
+REPO_NAME = "mixin-repo-{0}-{1}".format(int(time.time() * 10e3), uuid.uuid4())
 
 WORKING_REPO_SUBDIR = "fixtures/working_repo_2"
 WORKING_REPO_DIR = os.path.join(
