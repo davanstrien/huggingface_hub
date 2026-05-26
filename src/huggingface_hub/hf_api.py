@@ -2197,6 +2197,25 @@ class LocalVolume:
             self.local_path = self.local_path.expanduser()
 
 
+def _reject_local_volumes_in_scheduled_job(volumes: "list[Volume | LocalVolume] | None") -> None:
+    """Raise [`TypeError`] if any [`LocalVolume`] is present.
+
+    Scheduled jobs (`create_scheduled_job`, `create_scheduled_uv_job`) don't yet support
+    local-volume uploads — every fire would re-upload, billing would compound silently, and
+    naming/cleanup semantics aren't designed yet. Until that's worked out, fail explicitly
+    rather than letting `vol.to_dict()` raise an opaque `AttributeError` deeper in the stack.
+    """
+    if not volumes:
+        return
+    for v in volumes:
+        if isinstance(v, LocalVolume):
+            raise TypeError(
+                "LocalVolume is not yet supported in create_scheduled_job / "
+                "create_scheduled_uv_job. Pre-upload your data and pass a "
+                "Volume(type='bucket', source=..., mount_path=...) instead."
+            )
+
+
 class HfApi:
     """
     Client to interact with the Hugging Face Hub via HTTP.
@@ -11984,6 +12003,18 @@ class HfApi:
         env = env or {}
         secrets = secrets or {}
 
+        # Pre-check the /data reservation BEFORE uploading any local volumes.
+        # `_create_uv_command_env_and_secrets` also enforces this downstream, but it runs
+        # after `_resolve_local_volumes` — so without this pre-check, a `-v ./x:/data`
+        # combined with a local script would upload `./x` to the bucket and *then* raise,
+        # leaving an orphan subfolder + a charge against the user.
+        if volumes and any(Path(c).is_file() for c in [script] + (script_args or [])):
+            if any(v.mount_path == constants.HF_JOBS_ARTIFACTS_MOUNT_PATH for v in volumes):
+                raise ValueError(
+                    f"Mount path {constants.HF_JOBS_ARTIFACTS_MOUNT_PATH!r} is reserved for "
+                    "Jobs artifacts when running local scripts. Mount your volume at a different path."
+                )
+
         # Upload any local-path volumes (-v ./local:/path) before building the command,
         # so the /data reservation check downstream sees their real mount paths.
         volumes = self._resolve_local_volumes(volumes, namespace=namespace, token=token)
@@ -12110,6 +12141,8 @@ class HfApi:
             ```
 
         """
+        _reject_local_volumes_in_scheduled_job(volumes)
+
         if namespace is None:
             namespace = self.whoami(token=token)["name"]
 
@@ -12409,6 +12442,8 @@ class HfApi:
             >>> create_scheduled_uv_job(script, script_args=script_args, dependencies=["lighteval"], flavor="a10g-small", schedule="@weekly")
             ```
         """
+        _reject_local_volumes_in_scheduled_job(volumes)
+
         image = image or "ghcr.io/astral-sh/uv:python3.12-bookworm"
         # Build command
         command, env, secrets, extra_volumes = self._create_uv_command_env_and_secrets(
@@ -12704,7 +12739,8 @@ class HfApi:
         print(f"Local data from '{local_path}' uploaded to: {bucket_url.url}/{subfolder_id}")
         print(
             f"To pull data back after the job completes, run:\n"
-            f"    hf buckets sync hf://buckets/{volume.source}/{subfolder_id}/ {local_path}"
+            f"    hf buckets sync hf://buckets/{volume.source}/{subfolder_id}/ {local_path}\n"
+            f"    (overwrites local files of the same name — pass a different target dir to keep the local copy)"
         )
         return volume
 

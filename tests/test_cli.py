@@ -3653,6 +3653,71 @@ class TestLocalVolumeMount:
         spec = LocalVolume(local_path=str(tmp_path), mount_path="/data")
         assert spec.local_path == tmp_path
 
+    def test_data_reservation_pre_check_prevents_orphan_upload(self, tmp_path: Path) -> None:
+        """run_uv_job pre-checks the /data reservation BEFORE uploading any local volumes.
+
+        Without this guard, a local-script + `-v ./mydata:/data` would upload `./mydata`
+        to the bucket, then raise on the conflict — leaving an orphan subfolder + a
+        billed upload. The pre-check fires before _resolve_local_volumes, so no upload
+        should happen on conflict."""
+        from huggingface_hub.hf_api import HfApi, LocalVolume
+
+        script_path = tmp_path / "train.py"
+        script_path.write_text("print('hello')")
+        data_dir = tmp_path / "mydata"
+        data_dir.mkdir()
+        (data_dir / "x.txt").write_text("data")
+
+        api = HfApi()
+        with (
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files") as mock_batch,
+            patch.object(api, "run_job") as mock_run_job,
+            patch.object(api, "whoami", return_value={"name": "test-user"}),
+            pytest.raises(ValueError, match="reserved"),
+        ):
+            api.run_uv_job(
+                str(script_path),
+                volumes=[LocalVolume(local_path=data_dir, mount_path="/data")],
+                token=None,
+            )
+
+        # CRITICAL: no upload happened — pre-check fired before _resolve_local_volumes
+        mock_create_bucket.assert_not_called()
+        mock_batch.assert_not_called()
+        mock_run_job.assert_not_called()
+
+    def test_local_volume_rejected_in_create_scheduled_job(self) -> None:
+        """create_scheduled_job raises TypeError on LocalVolume — scheduled jobs aren't
+        wired yet (every fire would re-upload, no naming/cleanup semantics yet)."""
+        from huggingface_hub.hf_api import HfApi, LocalVolume
+
+        api = HfApi()
+        with pytest.raises(TypeError, match="LocalVolume is not yet supported"):
+            api.create_scheduled_job(
+                image="python:3.12",
+                command=["echo", "hi"],
+                schedule="@hourly",
+                volumes=[LocalVolume(local_path="/tmp", mount_path="/data")],
+                token=None,
+            )
+
+    def test_local_volume_rejected_in_create_scheduled_uv_job(self, tmp_path: Path) -> None:
+        """Same guard on create_scheduled_uv_job."""
+        from huggingface_hub.hf_api import HfApi, LocalVolume
+
+        script_path = tmp_path / "train.py"
+        script_path.write_text("print('hi')")
+
+        api = HfApi()
+        with pytest.raises(TypeError, match="LocalVolume is not yet supported"):
+            api.create_scheduled_uv_job(
+                str(script_path),
+                schedule="@hourly",
+                volumes=[LocalVolume(local_path="/tmp", mount_path="/data")],
+                token=None,
+            )
+
 
 class TestParseNamespaceFromJobId:
     """Unit tests for _parse_namespace_from_job_id."""
