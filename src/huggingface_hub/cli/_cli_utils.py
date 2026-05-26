@@ -34,6 +34,7 @@ from typer.core import TyperCommand, TyperGroup
 
 from huggingface_hub import Volume, __version__, constants
 from huggingface_hub.errors import CLIError
+from huggingface_hub.hf_api import _LocalVolumeSpec
 from huggingface_hub.utils import (
     get_session,
     hf_raise_for_status,
@@ -43,6 +44,7 @@ from huggingface_hub.utils import (
     tabulate,
 )
 from huggingface_hub.utils._dotenv import load_dotenv
+from huggingface_hub.utils._hf_uris import _split_mount
 
 from ._help_formatter import StyledContext
 from ._output import OutputFormatWithAuto, out
@@ -844,15 +846,18 @@ VolumesOpt = Annotated[
 ]
 
 
-def parse_volumes(volumes: list[str] | None) -> "list[Volume] | None":
+def parse_volumes(volumes: list[str] | None) -> "list[Volume | _LocalVolumeSpec] | None":
     """Parse volume specs from CLI arguments.
 
-    Format: hf://[TYPE/]SOURCE[/PATH]:/MOUNT_PATH[:ro|:rw]
-    Where TYPE is one of: models, datasets, spaces, buckets (defaults to models if omitted).
-    SOURCE is the repo/bucket identifier (e.g. 'username/my-model').
-    PATH is an optional subfolder inside the repo/bucket.
-    MOUNT_PATH starts with '/'.
-    Optional ':ro' or ':rw' suffix for read-only or read-write.
+    Two source kinds are accepted:
+
+    - **Hub URI** — `hf://[TYPE/]SOURCE[/PATH]:/MOUNT_PATH[:ro|:rw]`
+      where TYPE is one of: models, datasets, spaces, buckets (defaults to models).
+    - **Local path** (experimental) — `<local-path>:/MOUNT_PATH[:ro|:rw]`
+      where `<local-path>` is a file or directory on the local filesystem (relative
+      or absolute). The CLI will upload the contents to the user's `jobs-artifacts`
+      bucket and mount the resulting subfolder at `MOUNT_PATH`. Returned as a
+      [`_LocalVolumeSpec`] sentinel, resolved later by [`HfApi._resolve_local_volumes`].
 
     Examples:
         hf://my-org/my-model:/data                (model, implicit type)
@@ -862,12 +867,19 @@ def parse_volumes(volumes: list[str] | None) -> "list[Volume] | None":
         hf://spaces/my-org/my-space:/app
         hf://datasets/org/ds/train:/data          (with path inside repo)
         hf://buckets/org/b/sub/dir:/mnt           (with path inside bucket)
+        ./my-data:/data                           (local dir, upload + mount RW)
+        ./train.csv:/data/train.csv               (local file, upload + mount RW)
+        /abs/path/to/dir:/mnt:ro                  (local dir, mount read-only)
     """
     if not volumes:
         return None
 
-    result: list[Volume] = []
+    result: list[Volume | _LocalVolumeSpec] = []
     for raw_spec in volumes:
+        local_spec = _try_parse_local_volume(raw_spec)
+        if local_spec is not None:
+            result.append(local_spec)
+            continue
         mount = parse_hf_mount(raw_spec)
         result.append(
             Volume(
@@ -880,6 +892,30 @@ def parse_volumes(volumes: list[str] | None) -> "list[Volume] | None":
             )
         )
     return result
+
+
+def _try_parse_local_volume(raw_spec: str) -> "_LocalVolumeSpec | None":
+    """Return a [`_LocalVolumeSpec`] if `raw_spec` points at an existing local file/dir.
+
+    Returns `None` if the source side starts with `hf://` (defer to `parse_hf_mount`)
+    or if the local path doesn't exist (also defer — `parse_hf_mount` will raise the
+    existing "must start with 'hf://'" error, which is the right shape for an
+    accidental typo).
+    """
+    if raw_spec.startswith("hf://"):
+        return None
+
+    # Reuse the existing mount-string splitter: strips :ro/:rw, finds the trailing
+    # ':/MOUNT_PATH' segment, returns (location, mount_path, read_only). Robust to
+    # source-side colons (Windows paths) since it splits on ':/' not bare ':'.
+    location, mount_path, read_only = _split_mount(raw_spec, raw=raw_spec)
+    if mount_path is None:
+        return None
+
+    local_path = Path(location).expanduser()
+    if not local_path.exists():
+        return None
+    return _LocalVolumeSpec(local_path=local_path, mount_path=mount_path, read_only=read_only)
 
 
 class OutputFormat(str, Enum):

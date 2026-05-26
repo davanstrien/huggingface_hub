@@ -3361,6 +3361,239 @@ class TestBucketTransport:
         assert extra_volumes[0].path == upload_prefixes.pop()
 
 
+class TestLocalVolumeMount:
+    """Tests for `-v <local-path>:<mount-path>` (experimental).
+
+    Local-path sources are parsed into _LocalVolumeSpec sentinels by parse_volumes
+    and later resolved by HfApi._resolve_local_volumes — uploaded to the per-call
+    subfolder in the user's jobs-artifacts bucket, then mounted at the user's chosen
+    path inside the job container.
+    """
+
+    def test_parse_local_dir_returns_sentinel(self, tmp_path: Path) -> None:
+        """-v <local-dir>:<mount> produces a _LocalVolumeSpec sentinel, not a Volume."""
+        from huggingface_hub.hf_api import _LocalVolumeSpec
+
+        (tmp_path / "a.txt").write_text("hello")
+        parsed = parse_volumes([f"{tmp_path}:/mnt/data"])
+        assert parsed is not None and len(parsed) == 1
+        spec = parsed[0]
+        assert isinstance(spec, _LocalVolumeSpec)
+        assert spec.local_path == tmp_path
+        assert spec.mount_path == "/mnt/data"
+        assert spec.read_only is None
+
+    def test_parse_local_file_with_ro(self, tmp_path: Path) -> None:
+        """Single local file with :ro suffix → sentinel with read_only=True."""
+        from huggingface_hub.hf_api import _LocalVolumeSpec
+
+        file_path = tmp_path / "train.csv"
+        file_path.write_text("a,b\n1,2\n")
+        parsed = parse_volumes([f"{file_path}:/data/train.csv:ro"])
+        assert parsed is not None and len(parsed) == 1
+        spec = parsed[0]
+        assert isinstance(spec, _LocalVolumeSpec)
+        assert spec.local_path == file_path
+        assert spec.mount_path == "/data/train.csv"
+        assert spec.read_only is True
+
+    def test_parse_hf_uri_still_returns_volume(self, tmp_path: Path) -> None:
+        """Pre-existing hf:// volume syntax still parses to a Volume (no regression)."""
+        parsed = parse_volumes(["hf://datasets/HuggingFaceFW/fineweb:/data:ro"])
+        assert parsed is not None and len(parsed) == 1
+        vol = parsed[0]
+        assert isinstance(vol, Volume)
+        assert vol.type == "dataset"
+        assert vol.source == "HuggingFaceFW/fineweb"
+        assert vol.mount_path == "/data"
+        assert vol.read_only is True
+
+    def test_parse_nonexistent_local_path_errors_via_hf_uri_path(self) -> None:
+        """Source side that's neither hf:// nor an existing local path falls through
+        to parse_hf_mount, which raises the existing HfUriError."""
+        with pytest.raises(HfUriError, match="hf://"):
+            parse_volumes(["./this-path-does-not-exist:/foo"])
+
+    def test_upload_local_dir_walks_and_returns_volume(self, tmp_path: Path) -> None:
+        """_upload_local_to_bucket walks a directory and uploads each file under
+        the per-call subfolder. Returns a Volume mounted at the user's chosen path."""
+        from huggingface_hub.hf_api import HfApi
+
+        # tmp_path/a.txt, tmp_path/sub/b.txt
+        (tmp_path / "a.txt").write_text("hello")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "b.txt").write_text("world")
+
+        api = HfApi()
+        with (
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files") as mock_batch,
+        ):
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            volume = api._upload_local_to_bucket(
+                local_path=tmp_path,
+                mount_path="/mnt/data",
+                read_only=None,
+                namespace="test-user",
+                token=None,
+            )
+
+        mock_create_bucket.assert_called_once_with(
+            bucket_id="test-user/jobs-artifacts", exist_ok=True, token=None, private=True
+        )
+        add_ops = mock_batch.call_args.kwargs["add"]
+        # 2 files: a.txt and sub/b.txt
+        assert len(add_ops) == 2
+        remote_paths = {op[1] for op in add_ops}
+        # All uploads share the same per-call subfolder prefix
+        prefixes = {p.split("/", 1)[0] for p in remote_paths}
+        assert len(prefixes) == 1
+        subfolder = prefixes.pop()
+        assert {p[len(subfolder) + 1 :] for p in remote_paths} == {"a.txt", "sub/b.txt"}
+
+        # Volume mounted at user's chosen path, scoped to the subfolder via Volume.path
+        assert volume.type == "bucket"
+        assert volume.source == "test-user/jobs-artifacts"
+        assert volume.mount_path == "/mnt/data"
+        assert volume.path == subfolder
+        assert volume.read_only is None
+
+    def test_upload_local_file_uses_filename_as_remote_name(self, tmp_path: Path) -> None:
+        """A single local file is uploaded at the subfolder root with its original name."""
+        from huggingface_hub.hf_api import HfApi
+
+        file_path = tmp_path / "train.csv"
+        file_path.write_text("a,b\n1,2\n")
+
+        api = HfApi()
+        with (
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files") as mock_batch,
+        ):
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            volume = api._upload_local_to_bucket(
+                local_path=file_path,
+                mount_path="/data/train.csv",
+                read_only=True,
+                namespace="test-user",
+                token=None,
+            )
+
+        add_ops = mock_batch.call_args.kwargs["add"]
+        assert len(add_ops) == 1
+        # Remote path is {subfolder}/train.csv
+        assert add_ops[0][1].endswith("/train.csv")
+        assert add_ops[0][1].count("/") == 1
+        assert volume.read_only is True
+
+    def test_upload_empty_dir_raises(self, tmp_path: Path) -> None:
+        """Uploading an empty directory raises rather than silently succeeding."""
+        from huggingface_hub.hf_api import HfApi
+
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+
+        api = HfApi()
+        with (
+            patch.object(api, "create_bucket"),
+            patch.object(api, "batch_bucket_files"),
+            pytest.raises(ValueError, match="empty"),
+        ):
+            api._upload_local_to_bucket(
+                local_path=empty_dir,
+                mount_path="/mnt/data",
+                read_only=None,
+                namespace="test-user",
+                token=None,
+            )
+
+    def test_resolve_local_volumes_passes_through_real_volumes(self) -> None:
+        """_resolve_local_volumes is a no-op when no sentinels are present."""
+        from huggingface_hub.hf_api import HfApi
+
+        api = HfApi()
+        vols = [Volume(type="dataset", source="org/ds", mount_path="/data")]
+        # No API calls expected — no upload needed.
+        out = api._resolve_local_volumes(vols, namespace="test-user", token=None)
+        assert out == vols
+
+    def test_resolve_local_volumes_replaces_sentinels(self, tmp_path: Path) -> None:
+        """Sentinels are uploaded and replaced with real Volume objects."""
+        from huggingface_hub.hf_api import HfApi, _LocalVolumeSpec
+
+        (tmp_path / "a.txt").write_text("hello")
+        spec = _LocalVolumeSpec(local_path=tmp_path, mount_path="/mnt/data", read_only=None)
+        # Mix with a regular Volume to verify pass-through.
+        hub_vol = Volume(type="dataset", source="org/ds", mount_path="/data")
+
+        api = HfApi()
+        with (
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files"),
+        ):
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            resolved = api._resolve_local_volumes(
+                [hub_vol, spec], namespace="test-user", token=None
+            )
+
+        assert resolved is not None and len(resolved) == 2
+        # Hub volume passed through unchanged
+        assert resolved[0] is hub_vol
+        # Sentinel replaced with a bucket-backed Volume at the requested mount path
+        assert isinstance(resolved[1], Volume)
+        assert resolved[1].type == "bucket"
+        assert resolved[1].source == "test-user/jobs-artifacts"
+        assert resolved[1].mount_path == "/mnt/data"
+        assert resolved[1].path is not None  # subfolder_id
+
+    def test_experimental_warning_fires_for_local_volumes(self, tmp_path: Path) -> None:
+        """A UserWarning is emitted when a local-path volume is resolved, mirroring
+        the @experimental decorator pattern. Silenced by HF_HUB_DISABLE_EXPERIMENTAL_WARNING
+        (which conftest.py disables for the rest of the suite — we patch it back here)."""
+        from huggingface_hub.hf_api import HfApi, _LocalVolumeSpec
+
+        (tmp_path / "a.txt").write_text("hello")
+        spec = _LocalVolumeSpec(local_path=tmp_path, mount_path="/mnt/data", read_only=None)
+
+        api = HfApi()
+        with (
+            patch("huggingface_hub.constants.HF_HUB_DISABLE_EXPERIMENTAL_WARNING", False),
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files"),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            api._resolve_local_volumes([spec], namespace="test-user", token=None)
+
+        assert any(
+            issubclass(w.category, UserWarning) and "experimental" in str(w.message).lower()
+            for w in caught
+        ), f"Expected an experimental UserWarning, got: {[str(w.message) for w in caught]}"
+
+    def test_experimental_warning_silenced_by_env(self, tmp_path: Path) -> None:
+        """No warning when HF_HUB_DISABLE_EXPERIMENTAL_WARNING=True (matches conftest default)."""
+        from huggingface_hub.hf_api import HfApi, _LocalVolumeSpec
+
+        (tmp_path / "a.txt").write_text("hello")
+        spec = _LocalVolumeSpec(local_path=tmp_path, mount_path="/mnt/data", read_only=None)
+
+        api = HfApi()
+        with (
+            patch("huggingface_hub.constants.HF_HUB_DISABLE_EXPERIMENTAL_WARNING", True),
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files"),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            api._resolve_local_volumes([spec], namespace="test-user", token=None)
+
+        # Other warnings could still happen (resource warnings etc); filter to our experimental one.
+        experimental = [w for w in caught if "experimental" in str(w.message).lower()]
+        assert experimental == [], f"Expected no experimental warning, got: {experimental}"
+
+
 class TestParseNamespaceFromJobId:
     """Unit tests for _parse_namespace_from_job_id."""
 

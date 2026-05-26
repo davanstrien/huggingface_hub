@@ -54,6 +54,7 @@ from ._buckets import (
     _BucketAddFile,
     _BucketCopyFile,
     _BucketDeleteFile,
+    _list_local_files,
     _parse_bucket_uri,
     sync_bucket_internal,
 )
@@ -2136,6 +2137,19 @@ def _parse_safetensors_header(metadata_as_bytes: bytes, filename: str, context_m
             f"Failed to parse safetensors header for '{filename}' ({context_msg}): header format not recognized. "
             "Please make sure this is a correctly formatted safetensors file."
         ) from e
+
+
+@dataclass
+class _LocalVolumeSpec:
+    """Internal sentinel produced by [`parse_volumes`] when a `-v` argument points at a local path.
+
+    Resolved by [`HfApi._resolve_local_volumes`] into a real [`Volume`] backed by an upload
+    to the user's `jobs-artifacts` bucket. Not part of the public API.
+    """
+
+    local_path: Path
+    mount_path: str
+    read_only: bool | None = None
 
 
 class HfApi:
@@ -11468,6 +11482,7 @@ class HfApi:
         """
         if namespace is None:
             namespace = self.whoami(token=token)["name"]
+        volumes = self._resolve_local_volumes(volumes, namespace=namespace, token=token)
         job_spec = _create_job_spec(
             image=image,
             command=command,
@@ -11923,6 +11938,10 @@ class HfApi:
         image = image or "ghcr.io/astral-sh/uv:python3.12-bookworm"
         env = env or {}
         secrets = secrets or {}
+
+        # Upload any local-path volumes (-v ./local:/path) before building the command,
+        # so the /data reservation check downstream sees their real mount paths.
+        volumes = self._resolve_local_volumes(volumes, namespace=namespace, token=token)
 
         # Build command
         command, env, secrets, extra_volumes = self._create_uv_command_env_and_secrets(
@@ -12468,6 +12487,51 @@ class HfApi:
         command = ["uv", "run"] + uv_args + [script] + script_args
         return command, env, secrets, extra_volumes
 
+    def _upload_to_jobs_artifacts_bucket(
+        self,
+        *,
+        namespace: str,
+        add_ops: list[tuple[str | Path | bytes, str]],
+        mount_path: str,
+        read_only: bool | None,
+        token: bool | str | None,
+    ) -> tuple[Volume, BucketUrl, str]:
+        """Upload files to a fresh per-call subfolder of the user's `jobs-artifacts` bucket.
+
+        Creates the `{namespace}/jobs-artifacts` bucket (if missing), generates a
+        `{timestamp}-{random}` subfolder, prefixes each `add_ops` entry with that
+        subfolder, batch-uploads, and returns a [`Volume`] scoped to the subfolder
+        (so the job container sees the uploaded files directly at `mount_path`).
+
+        Args:
+            namespace: Owner of the bucket.
+            add_ops: List of `(local_path_or_bytes, rel_path_within_subfolder)` tuples.
+            mount_path: Where to mount inside the container.
+            read_only: `:ro`/`:rw`/None as parsed from the CLI; `None` means "server default".
+            token: Auth token.
+
+        Returns:
+            `(volume, bucket_url, subfolder_id)` — callers can compose user-facing messages
+            with the bucket URL and subfolder id.
+        """
+        bucket_id = f"{namespace}/{constants.HF_JOBS_ARTIFACTS_BUCKET_NAME}"
+        subfolder_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{token_hex(3)}"
+        bucket_url = self.create_bucket(bucket_id=bucket_id, exist_ok=True, token=token, private=True)
+
+        prefixed_ops: list[tuple[str | Path | bytes, str]] = [
+            (local, f"{subfolder_id}/{rel}") for local, rel in add_ops
+        ]
+        self.batch_bucket_files(bucket_id=bucket_id, add=prefixed_ops, token=token)
+
+        volume = Volume(
+            type="bucket",
+            source=bucket_id,
+            mount_path=mount_path,
+            path=subfolder_id,
+            read_only=read_only,
+        )
+        return volume, bucket_url, subfolder_id
+
     def _upload_scripts_to_bucket(
         self,
         *,
@@ -12477,30 +12541,116 @@ class HfApi:
     ) -> list[Volume]:
         """Upload script files to a per-job subfolder in the artifacts bucket.
 
-        Creates a bucket `/jobs-artifacts` (if it doesn't exist) and uploads
-        each script to `{timestamp}-{random}/{remote_name}` inside it. Returns a
-        [`Volume`] scoped to that bucket subfolder. Volume is in read-write mode so the Job can save data back to this bucket.
+        Returns a single [`Volume`] mounted at [`constants.HF_JOBS_ARTIFACTS_MOUNT_PATH`]
+        (read-write so the Job can save data back). Wrapper around
+        [`_upload_to_jobs_artifacts_bucket`].
         """
-        bucket_id = f"{namespace}/{constants.HF_JOBS_ARTIFACTS_BUCKET_NAME}"
-        subfolder_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{token_hex(3)}"
-
-        bucket_url = self.create_bucket(bucket_id=bucket_id, exist_ok=True, token=token, private=True)
-
         add_ops: list[tuple[str | Path | bytes, str]] = [
-            (Path(local_path), f"{subfolder_id}/{remote_name}")
-            for remote_name, local_path in remote_to_local_file_names.items()
+            (Path(local_path), remote_name) for remote_name, local_path in remote_to_local_file_names.items()
         ]
-        self.batch_bucket_files(bucket_id=bucket_id, add=add_ops, token=token)
-        print(f"Your script and Job artifacts will be saved in this bucket: {bucket_url.url}")
-
-        volume = Volume(
-            type="bucket",
-            source=bucket_id,
+        volume, bucket_url, _ = self._upload_to_jobs_artifacts_bucket(
+            namespace=namespace,
+            add_ops=add_ops,
             mount_path=constants.HF_JOBS_ARTIFACTS_MOUNT_PATH,
-            path=subfolder_id,
             read_only=False,
+            token=token,
         )
+        print(f"Your script and Job artifacts will be saved in this bucket: {bucket_url.url}")
         return [volume]
+
+    def _resolve_local_volumes(
+        self,
+        volumes: "list[Volume | _LocalVolumeSpec] | None",
+        *,
+        namespace: str | None,
+        token: bool | str | None,
+    ) -> list[Volume] | None:
+        """Resolve any [`_LocalVolumeSpec`] sentinels in `volumes` to real [`Volume`] objects.
+
+        Each local-path source is uploaded to a per-mount subfolder in the user's
+        `jobs-artifacts` bucket (created with `exist_ok=True`), then mounted at the
+        user-supplied destination path. Existing [`Volume`] entries are passed through
+        unchanged. Returns `None` if `volumes` is `None`.
+
+        Emits a `UserWarning` once per session when local paths are detected; honored
+        by `HF_HUB_DISABLE_EXPERIMENTAL_WARNING=1`.
+        """
+        if not volumes:
+            return volumes  # type: ignore[return-value]
+        if not any(isinstance(v, _LocalVolumeSpec) for v in volumes):
+            return volumes  # type: ignore[return-value]
+
+        if not constants.HF_HUB_DISABLE_EXPERIMENTAL_WARNING:
+            warnings.warn(
+                "Mounting local directories via '-v <local-path>:<mount-path>' is experimental and may"
+                " change without notice. Please share feedback at"
+                " https://github.com/huggingface/huggingface_hub/issues."
+                " You can disable this warning by setting `HF_HUB_DISABLE_EXPERIMENTAL_WARNING=1` as"
+                " environment variable.",
+                UserWarning,
+            )
+
+        if namespace is None:
+            namespace = self.whoami(token=token)["name"]
+
+        resolved: list[Volume] = []
+        for v in volumes:
+            if isinstance(v, _LocalVolumeSpec):
+                resolved.append(
+                    self._upload_local_to_bucket(
+                        local_path=v.local_path,
+                        mount_path=v.mount_path,
+                        read_only=v.read_only,
+                        namespace=namespace,
+                        token=token,
+                    )
+                )
+            else:
+                resolved.append(v)
+        return resolved
+
+    def _upload_local_to_bucket(
+        self,
+        *,
+        local_path: Path,
+        mount_path: str,
+        read_only: bool | None,
+        namespace: str,
+        token: bool | str | None,
+    ) -> Volume:
+        """Upload a local file or directory to a per-mount subfolder in the artifacts bucket.
+
+        For directories, files are uploaded recursively preserving their relative paths
+        (via the same walker the buckets `sync` CLI uses, [`_list_local_files`]). For
+        single files, the file is uploaded at the subfolder root with its original name.
+        Returns a [`Volume`] scoped to the subfolder so the job container sees the
+        uploaded contents directly at `mount_path`.
+        """
+        if not local_path.exists():
+            raise FileNotFoundError(f"Local path '{local_path}' does not exist.")
+
+        if local_path.is_dir():
+            add_ops: list[tuple[str | Path | bytes, str]] = [
+                (local_path / rel, rel) for rel, _size, _mtime in _list_local_files(str(local_path))
+            ]
+            if not add_ops:
+                raise ValueError(f"Local directory '{local_path}' is empty; nothing to upload.")
+        else:
+            add_ops = [(local_path, local_path.name)]
+
+        volume, bucket_url, subfolder_id = self._upload_to_jobs_artifacts_bucket(
+            namespace=namespace,
+            add_ops=add_ops,
+            mount_path=mount_path,
+            read_only=read_only,
+            token=token,
+        )
+        print(f"Local data from '{local_path}' uploaded to: {bucket_url.url}/{subfolder_id}")
+        print(
+            f"To pull data back after the job completes, run:\n"
+            f"    hf buckets sync hf://buckets/{volume.source}/{subfolder_id}/ {local_path}"
+        )
+        return volume
 
     @validate_hf_hub_args
     def create_bucket(
