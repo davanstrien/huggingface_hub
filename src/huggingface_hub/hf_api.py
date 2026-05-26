@@ -12625,16 +12625,36 @@ class HfApi:
         single files, the file is uploaded at the subfolder root with its original name.
         Returns a [`Volume`] scoped to the subfolder so the job container sees the
         uploaded contents directly at `mount_path`.
+
+        Filtering: applies [`DEFAULT_IGNORE_PATTERNS`] (the same defaults as
+        `upload_folder` — excludes `.git/` and `.cache/huggingface/`). Whether to extend
+        defaults to cover secret-prone files like `.env*` is an open design question
+        deferred to the issue discussion.
+
+        Empty directories are allowed (and common: e.g. `-v ./output:/output` for a
+        job to write into). In that case no files are uploaded, but the bucket subfolder
+        is still reserved via a `.hf_jobs_keep` placeholder so the volume mount has a
+        target.
         """
         if not local_path.exists():
             raise FileNotFoundError(f"Local path '{local_path}' does not exist.")
 
         if local_path.is_dir():
-            add_ops: list[tuple[str | Path | bytes, str]] = [
-                (local_path / rel, rel) for rel, _size, _mtime in _list_local_files(str(local_path))
-            ]
+            all_rel = [rel for rel, _size, _mtime in _list_local_files(str(local_path))]
+            kept_rel = list(filter_repo_objects(all_rel, ignore_patterns=DEFAULT_IGNORE_PATTERNS))
+            skipped = sorted(set(all_rel) - set(kept_rel))
+            if skipped:
+                print(
+                    f"Skipped {len(skipped)} file(s) matching DEFAULT_IGNORE_PATTERNS "
+                    f"(.git/, .cache/huggingface/): {', '.join(skipped[:5])}"
+                    f"{', ...' if len(skipped) > 5 else ''}"
+                )
+            add_ops: list[tuple[str | Path | bytes, str]] = [(local_path / rel, rel) for rel in kept_rel]
             if not add_ops:
-                raise ValueError(f"Local directory '{local_path}' is empty; nothing to upload.")
+                # Empty dir (or all files filtered out) — reserve the subfolder with a
+                # placeholder so the volume has a valid mount target. Common when the
+                # mount is an output destination the job will populate.
+                add_ops = [(b"", ".hf_jobs_keep")]
         else:
             add_ops = [(local_path, local_path.name)]
 

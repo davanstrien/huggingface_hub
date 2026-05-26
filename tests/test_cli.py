@@ -3486,8 +3486,10 @@ class TestLocalVolumeMount:
         assert add_ops[0][1].count("/") == 1
         assert volume.read_only is True
 
-    def test_upload_empty_dir_raises(self, tmp_path: Path) -> None:
-        """Uploading an empty directory raises rather than silently succeeding."""
+    def test_upload_empty_dir_uses_placeholder(self, tmp_path: Path) -> None:
+        """An empty source directory is allowed (e.g. for output mounts the job will
+        populate); a `.hf_jobs_keep` placeholder is uploaded so the bucket subfolder
+        exists and the volume has a valid mount target."""
         from huggingface_hub.hf_api import HfApi
 
         empty_dir = tmp_path / "empty"
@@ -3495,17 +3497,54 @@ class TestLocalVolumeMount:
 
         api = HfApi()
         with (
-            patch.object(api, "create_bucket"),
-            patch.object(api, "batch_bucket_files"),
-            pytest.raises(ValueError, match="empty"),
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files") as mock_batch,
         ):
-            api._upload_local_to_bucket(
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            volume = api._upload_local_to_bucket(
                 local_path=empty_dir,
                 mount_path="/mnt/data",
                 read_only=None,
                 namespace="test-user",
                 token=None,
             )
+
+        add_ops = mock_batch.call_args.kwargs["add"]
+        assert len(add_ops) == 1
+        # Placeholder uses bytes content (not a Path) so we don't need a file on disk.
+        assert add_ops[0][0] == b""
+        assert add_ops[0][1].endswith("/.hf_jobs_keep")
+        assert volume.mount_path == "/mnt/data"
+
+    def test_upload_filters_default_ignore_patterns(self, tmp_path: Path) -> None:
+        """`.git/` and `.cache/huggingface/` are filtered out by default."""
+        from huggingface_hub.hf_api import HfApi
+
+        (tmp_path / "real.txt").write_text("kept")
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "config").write_text("git-internals")
+
+        api = HfApi()
+        with (
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files") as mock_batch,
+        ):
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            api._upload_local_to_bucket(
+                local_path=tmp_path,
+                mount_path="/mnt/data",
+                read_only=None,
+                namespace="test-user",
+                token=None,
+            )
+
+        add_ops = mock_batch.call_args.kwargs["add"]
+        # Only real.txt should be uploaded — .git/config is filtered.
+        remote_paths = [op[1] for op in add_ops]
+        rel_paths = [p.split("/", 1)[1] for p in remote_paths]  # strip {subfolder}/ prefix
+        assert "real.txt" in rel_paths
+        assert not any("config" in p for p in rel_paths), f"Expected .git/config to be filtered, got {rel_paths}"
 
     def test_resolve_local_volumes_passes_through_real_volumes(self) -> None:
         """_resolve_local_volumes is a no-op when no sentinels are present."""
