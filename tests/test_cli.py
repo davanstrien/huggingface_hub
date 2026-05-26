@@ -3364,35 +3364,35 @@ class TestBucketTransport:
 class TestLocalVolumeMount:
     """Tests for `-v <local-path>:<mount-path>` (experimental).
 
-    Local-path sources are parsed into _LocalVolumeSpec sentinels by parse_volumes
+    Local-path sources are parsed into LocalVolume sentinels by parse_volumes
     and later resolved by HfApi._resolve_local_volumes — uploaded to the per-call
     subfolder in the user's jobs-artifacts bucket, then mounted at the user's chosen
     path inside the job container.
     """
 
     def test_parse_local_dir_returns_sentinel(self, tmp_path: Path) -> None:
-        """-v <local-dir>:<mount> produces a _LocalVolumeSpec sentinel, not a Volume."""
-        from huggingface_hub.hf_api import _LocalVolumeSpec
+        """-v <local-dir>:<mount> produces a LocalVolume sentinel, not a Volume."""
+        from huggingface_hub.hf_api import LocalVolume
 
         (tmp_path / "a.txt").write_text("hello")
         parsed = parse_volumes([f"{tmp_path}:/mnt/data"])
         assert parsed is not None and len(parsed) == 1
         spec = parsed[0]
-        assert isinstance(spec, _LocalVolumeSpec)
+        assert isinstance(spec, LocalVolume)
         assert spec.local_path == tmp_path
         assert spec.mount_path == "/mnt/data"
         assert spec.read_only is None
 
     def test_parse_local_file_with_ro(self, tmp_path: Path) -> None:
         """Single local file with :ro suffix → sentinel with read_only=True."""
-        from huggingface_hub.hf_api import _LocalVolumeSpec
+        from huggingface_hub.hf_api import LocalVolume
 
         file_path = tmp_path / "train.csv"
         file_path.write_text("a,b\n1,2\n")
         parsed = parse_volumes([f"{file_path}:/data/train.csv:ro"])
         assert parsed is not None and len(parsed) == 1
         spec = parsed[0]
-        assert isinstance(spec, _LocalVolumeSpec)
+        assert isinstance(spec, LocalVolume)
         assert spec.local_path == file_path
         assert spec.mount_path == "/data/train.csv"
         assert spec.read_only is True
@@ -3558,10 +3558,10 @@ class TestLocalVolumeMount:
 
     def test_resolve_local_volumes_replaces_sentinels(self, tmp_path: Path) -> None:
         """Sentinels are uploaded and replaced with real Volume objects."""
-        from huggingface_hub.hf_api import HfApi, _LocalVolumeSpec
+        from huggingface_hub.hf_api import HfApi, LocalVolume
 
         (tmp_path / "a.txt").write_text("hello")
-        spec = _LocalVolumeSpec(local_path=tmp_path, mount_path="/mnt/data", read_only=None)
+        spec = LocalVolume(local_path=tmp_path, mount_path="/mnt/data", read_only=None)
         # Mix with a regular Volume to verify pass-through.
         hub_vol = Volume(type="dataset", source="org/ds", mount_path="/data")
 
@@ -3585,52 +3585,73 @@ class TestLocalVolumeMount:
         assert resolved[1].mount_path == "/mnt/data"
         assert resolved[1].path is not None  # subfolder_id
 
-    def test_experimental_warning_fires_for_local_volumes(self, tmp_path: Path) -> None:
-        """A UserWarning is emitted when a local-path volume is resolved, mirroring
-        the @experimental decorator pattern. Silenced by HF_HUB_DISABLE_EXPERIMENTAL_WARNING
-        (which conftest.py disables for the rest of the suite — we patch it back here)."""
-        from huggingface_hub.hf_api import HfApi, _LocalVolumeSpec
+    def test_experimental_warning_fires_on_construction(self, tmp_path: Path) -> None:
+        """A UserWarning is emitted when LocalVolume is constructed (via @experimental on __new__).
+        Silenced by HF_HUB_DISABLE_EXPERIMENTAL_WARNING (which conftest.py disables for the rest
+        of the suite — we patch it back here)."""
+        from huggingface_hub.hf_api import LocalVolume
 
         (tmp_path / "a.txt").write_text("hello")
-        spec = _LocalVolumeSpec(local_path=tmp_path, mount_path="/mnt/data", read_only=None)
 
-        api = HfApi()
         with (
             patch("huggingface_hub.constants.HF_HUB_DISABLE_EXPERIMENTAL_WARNING", False),
-            patch.object(api, "create_bucket") as mock_create_bucket,
-            patch.object(api, "batch_bucket_files"),
             warnings.catch_warnings(record=True) as caught,
         ):
             warnings.simplefilter("always")
-            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
-            api._resolve_local_volumes([spec], namespace="test-user", token=None)
+            LocalVolume(local_path=tmp_path, mount_path="/mnt/data")  # noqa: B018 — construction is the assertion
 
         assert any(
-            issubclass(w.category, UserWarning) and "experimental" in str(w.message).lower()
+            issubclass(w.category, UserWarning) and "LocalVolume" in str(w.message) and "experimental" in str(w.message)
             for w in caught
-        ), f"Expected an experimental UserWarning, got: {[str(w.message) for w in caught]}"
+        ), f"Expected an experimental UserWarning for LocalVolume, got: {[str(w.message) for w in caught]}"
 
     def test_experimental_warning_silenced_by_env(self, tmp_path: Path) -> None:
         """No warning when HF_HUB_DISABLE_EXPERIMENTAL_WARNING=True (matches conftest default)."""
-        from huggingface_hub.hf_api import HfApi, _LocalVolumeSpec
+        from huggingface_hub.hf_api import LocalVolume
 
         (tmp_path / "a.txt").write_text("hello")
-        spec = _LocalVolumeSpec(local_path=tmp_path, mount_path="/mnt/data", read_only=None)
 
-        api = HfApi()
         with (
             patch("huggingface_hub.constants.HF_HUB_DISABLE_EXPERIMENTAL_WARNING", True),
-            patch.object(api, "create_bucket") as mock_create_bucket,
-            patch.object(api, "batch_bucket_files"),
             warnings.catch_warnings(record=True) as caught,
         ):
             warnings.simplefilter("always")
-            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
-            api._resolve_local_volumes([spec], namespace="test-user", token=None)
+            LocalVolume(local_path=tmp_path, mount_path="/mnt/data")  # noqa: B018
 
-        # Other warnings could still happen (resource warnings etc); filter to our experimental one.
         experimental = [w for w in caught if "experimental" in str(w.message).lower()]
         assert experimental == [], f"Expected no experimental warning, got: {experimental}"
+
+    def test_public_api_local_volume_via_run_uv_job(self, tmp_path: Path) -> None:
+        """LocalVolume passed directly to volumes= (Python API) reaches _resolve_local_volumes
+        and triggers an upload — same code path as the CLI."""
+        from huggingface_hub.hf_api import HfApi, LocalVolume
+
+        (tmp_path / "data.txt").write_text("hello")
+        local_vol = LocalVolume(local_path=tmp_path, mount_path="/data")
+
+        api = HfApi()
+        with (
+            patch.object(api, "create_bucket") as mock_create_bucket,
+            patch.object(api, "batch_bucket_files"),
+        ):
+            mock_create_bucket.return_value.url = "https://huggingface.co/buckets/test-user/jobs-artifacts"
+            resolved = api._resolve_local_volumes([local_vol], namespace="test-user", token=None)
+
+        assert resolved is not None and len(resolved) == 1
+        v = resolved[0]
+        assert isinstance(v, Volume)
+        assert v.type == "bucket"
+        assert v.source == "test-user/jobs-artifacts"
+        assert v.mount_path == "/data"
+        assert v.path is not None  # subfolder_id
+
+    def test_local_volume_accepts_str_path(self, tmp_path: Path) -> None:
+        """LocalVolume normalises a str `local_path` to Path via __post_init__."""
+        from huggingface_hub.hf_api import LocalVolume
+
+        (tmp_path / "a.txt").write_text("hello")
+        spec = LocalVolume(local_path=str(tmp_path), mount_path="/data")
+        assert spec.local_path == tmp_path
 
 
 class TestParseNamespaceFromJobId:

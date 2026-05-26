@@ -186,6 +186,7 @@ _SUBMOD_ATTRS = {
         "GitRefs",
         "HfApi",
         "KernelInfo",
+        "LocalVolume",
         "ModelInfo",
         "Organization",
         "RepoFile",
@@ -773,6 +774,7 @@ __all__ = [
     "JobStage",
     "JobStatus",
     "KernelInfo",
+    "LocalVolume",
     "MCPClient",
     "ModelCard",
     "ModelCardData",
@@ -1336,6 +1338,7 @@ if TYPE_CHECKING:  # pragma: no cover
         GitRefs,  # noqa: F401
         HfApi,  # noqa: F401
         KernelInfo,  # noqa: F401
+        LocalVolume,  # noqa: F401
         ModelInfo,  # noqa: F401
         Organization,  # noqa: F401
         RepoFile,  # noqa: F401

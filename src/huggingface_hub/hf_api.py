@@ -2140,16 +2140,61 @@ def _parse_safetensors_header(metadata_as_bytes: bytes, filename: str, context_m
 
 
 @dataclass
-class _LocalVolumeSpec:
-    """Internal sentinel produced by [`parse_volumes`] when a `-v` argument points at a local path.
+class LocalVolume:
+    """A local file or directory to upload + mount as a volume in a Job container.
 
-    Resolved by [`HfApi._resolve_local_volumes`] into a real [`Volume`] backed by an upload
-    to the user's `jobs-artifacts` bucket. Not part of the public API.
+    > [!WARNING]
+    > Local volume mounts are **experimental** and may change without prior notice.
+    > A [`UserWarning`] is emitted on construction (via the [`experimental`] decorator).
+    > Silence with `HF_HUB_DISABLE_EXPERIMENTAL_WARNING=1`.
+
+    Pass a [`LocalVolume`] in the `volumes=` list of [`run_job`] or [`run_uv_job`] alongside
+    regular [`Volume`] entries. On submission, [`HfApi`] uploads `local_path` to a per-call
+    subfolder of the user's `jobs-artifacts` bucket and the resulting bucket subfolder is
+    mounted at `mount_path` inside the job container. The same machinery that uploads local
+    scripts via [`run_uv_job(script="./local.py", ...)`][~HfApi.run_uv_job] is reused.
+
+    Equivalent of the CLI form `hf jobs uv run script.py -v <local_path>:<mount_path>`.
+
+    Args:
+        local_path (`Path` or `str`):
+            Local file or directory to upload. Must exist. Relative paths are resolved
+            from the current working directory; `~` is expanded.
+        mount_path (`str`):
+            Where to mount the uploaded data inside the job container. Must start with `/`.
+        read_only (`bool` or `None`, *optional*):
+            Mount the volume read-only. Defaults to `None` (writable, so the job can save
+            outputs back to the bucket subfolder — pull them back afterwards with
+            `hf buckets sync hf://buckets/<ns>/jobs-artifacts/<subfolder>/ <local>`).
+
+    Example:
+        ```python
+        >>> from huggingface_hub import LocalVolume, Volume, run_uv_job
+        >>> run_uv_job(
+        ...     "train.py",
+        ...     volumes=[
+        ...         LocalVolume(local_path="./training-data", mount_path="/data"),
+        ...         LocalVolume(local_path="./fixtures", mount_path="/fixtures", read_only=True),
+        ...         Volume(type="dataset", source="HuggingFaceFW/fineweb", mount_path="/fineweb", read_only=True),
+        ...     ],
+        ... )
+        ```
     """
+
+    @experimental
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
 
     local_path: Path
     mount_path: str
     read_only: bool | None = None
+
+    def __post_init__(self) -> None:
+        # Accept str | Path for ergonomics; normalise to Path so downstream code is uniform.
+        if not isinstance(self.local_path, Path):
+            self.local_path = Path(self.local_path).expanduser()
+        else:
+            self.local_path = self.local_path.expanduser()
 
 
 class HfApi:
@@ -12560,42 +12605,33 @@ class HfApi:
 
     def _resolve_local_volumes(
         self,
-        volumes: "list[Volume | _LocalVolumeSpec] | None",
+        volumes: "list[Volume | LocalVolume] | None",
         *,
         namespace: str | None,
         token: bool | str | None,
     ) -> list[Volume] | None:
-        """Resolve any [`_LocalVolumeSpec`] sentinels in `volumes` to real [`Volume`] objects.
+        """Resolve any [`LocalVolume`] sentinels in `volumes` to real [`Volume`] objects.
 
         Each local-path source is uploaded to a per-mount subfolder in the user's
         `jobs-artifacts` bucket (created with `exist_ok=True`), then mounted at the
         user-supplied destination path. Existing [`Volume`] entries are passed through
         unchanged. Returns `None` if `volumes` is `None`.
 
-        Emits a `UserWarning` once per session when local paths are detected; honored
-        by `HF_HUB_DISABLE_EXPERIMENTAL_WARNING=1`.
+        The experimental warning is emitted by [`LocalVolume.__new__`] (via the
+        [`experimental`] decorator), not here — so direct Python users see it on
+        construction, CLI users see it when `parse_volumes` builds the sentinel.
         """
         if not volumes:
             return volumes  # type: ignore[return-value]
-        if not any(isinstance(v, _LocalVolumeSpec) for v in volumes):
+        if not any(isinstance(v, LocalVolume) for v in volumes):
             return volumes  # type: ignore[return-value]
-
-        if not constants.HF_HUB_DISABLE_EXPERIMENTAL_WARNING:
-            warnings.warn(
-                "Mounting local directories via '-v <local-path>:<mount-path>' is experimental and may"
-                " change without notice. Please share feedback at"
-                " https://github.com/huggingface/huggingface_hub/issues."
-                " You can disable this warning by setting `HF_HUB_DISABLE_EXPERIMENTAL_WARNING=1` as"
-                " environment variable.",
-                UserWarning,
-            )
 
         if namespace is None:
             namespace = self.whoami(token=token)["name"]
 
         resolved: list[Volume] = []
         for v in volumes:
-            if isinstance(v, _LocalVolumeSpec):
+            if isinstance(v, LocalVolume):
                 resolved.append(
                     self._upload_local_to_bucket(
                         local_path=v.local_path,
