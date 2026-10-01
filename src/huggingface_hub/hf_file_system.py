@@ -3,7 +3,7 @@ import tempfile
 import threading
 from collections import deque
 from collections.abc import Iterable, Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -19,7 +19,7 @@ from fsspec.config import apply_config
 from fsspec.utils import isfilelike
 
 from . import constants
-from ._buckets import BucketFile, BucketFolder
+from ._buckets import BucketFile, BucketFolder, _BucketAddFile
 from ._commit_api import CommitOperationCopy, CommitOperationDelete
 from ._local_folder import _validate_relative_filename
 from .errors import (
@@ -33,7 +33,13 @@ from .file_download import hf_hub_url, http_get, xet_get
 from .hf_api import SPECIAL_REFS_REVISION_REGEX, HfApi, LastCommitInfo, RepoFile, RepoFolder
 from .utils import HFValidationError, XetFileData, hf_raise_for_status, http_backoff, http_stream_backoff, parse_hf_uri
 from .utils._runtime import is_xet_available
-from .utils._xet import XetTokenType, xet_connection_info_refresh_url
+from .utils._xet import (
+    XetTokenType,
+    abort_xet_session,
+    get_xet_session,
+    xet_connection_info_refresh_url,
+    xet_headers_without_auth,
+)
 from .utils.insecure_hashlib import md5
 
 
@@ -1212,6 +1218,15 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
         }
 
 
+def _is_xet_stream_upload_available() -> bool:
+    """Whether bucket writes can be streamed to Xet. If not, they go through a local temporary file."""
+    if not is_xet_available():
+        return False
+    from hf_xet import XetUploadCommit
+
+    return hasattr(XetUploadCommit, "start_upload_stream")
+
+
 class HfFileSystemFile(fsspec.spec.AbstractBufferedFile):
     def __init__(self, fs: HfFileSystem, path: str, revision: str | None = None, **kwargs):
         try:
@@ -1224,12 +1239,44 @@ class HfFileSystemFile(fsspec.spec.AbstractBufferedFile):
             raise
         super().__init__(fs, self.resolved_path.unresolve(), **kwargs)
         self.fs: HfFileSystem
+        self.temp_file: Any = None
+        # Bucket writes are streamed to Xet (no local copy) when `hf_xet` supports it
+        self._xet_commit: Any = None
+        self._xet_stream: Any = None
 
     def __del__(self):
         if not hasattr(self, "resolved_path"):
             # Means that the constructor failed. Nothing to do.
             return
+        # A file that is garbage collected without being closed is still committed (same as fsspec),
+        # unless it was discarded or a write failed. Use `discard()` to abort explicitly.
         return super().__del__()
+
+    def __exit__(self, *args):
+        if args and args[0] is not None and self._is_bucket_write():
+            # Do not replace the remote file with a partial one if the `with` block raised
+            self.discard()
+        else:
+            super().__exit__(*args)
+
+    def _is_bucket_write(self) -> bool:
+        return self.mode != "rb" and isinstance(self.resolved_path, HfFileSystemResolvedBucketPath)
+
+    def discard(self) -> None:
+        """Abort a write to a bucket: drop the data written so far and close the file without committing it.
+
+        This is also what happens when a `with` block is left because of an exception. No-op for repositories.
+        """
+        if self.closed or not self._is_bucket_write():
+            return
+        self.closed = True
+        for xet_handle in (self._xet_stream, self._xet_commit):
+            if xet_handle is not None:
+                with suppress(Exception):  # best effort: nothing is registered in the bucket anyway
+                    xet_handle.abort()
+        if self.temp_file is not None:
+            self.temp_file.close()
+            os.remove(self.temp_file.name)
 
     def _fetch_range(self, start: int, end: int) -> bytes:
         headers = {
@@ -1242,11 +1289,47 @@ class HfFileSystemFile(fsspec.spec.AbstractBufferedFile):
         return r.content
 
     def _initiate_upload(self) -> None:
-        self.temp_file = tempfile.NamedTemporaryFile(prefix="hffs-", delete=False)
+        if self._is_bucket_write() and _is_xet_stream_upload_available():
+            from hf_xet import SKIP_SHA256
+
+            headers = self.fs._api._build_hf_headers()
+            self._xet_commit = get_xet_session().new_upload_commit(
+                token_refresh_url=xet_connection_info_refresh_url(
+                    token_type=XetTokenType.WRITE,
+                    repo_id=self.resolved_path.bucket_id,
+                    repo_type="bucket",
+                    endpoint=self.fs.endpoint,
+                ),
+                token_refresh_headers=headers,
+                custom_headers=xet_headers_without_auth(headers),
+            )
+            self._xet_stream = self._xet_commit.start_upload_stream(name=self.resolved_path.path, sha256=SKIP_SHA256)
+        else:
+            self.temp_file = tempfile.NamedTemporaryFile(prefix="hffs-", delete=False)
+
+    def _upload_chunk_to_xet_stream(self, block: bytes, final: bool) -> None:
+        try:
+            if block:
+                self._xet_stream.write(block)
+            if final:
+                xet_info = self._xet_stream.finish().xet_info  # must be called before `wait_to_finish`
+                self._xet_commit.wait_to_finish()
+                # The data is already on Xet: only register the file in the bucket (hence the empty source)
+                add = _BucketAddFile(b"", self.resolved_path.path, xet_hash=xet_info.hash, size=xet_info.file_size)
+                self.fs._api._batch_bucket_files(self.resolved_path.bucket_id, add=[add])
+        except BaseException as e:
+            self.discard()  # a failed write must never be committed by a later `close()`
+            if isinstance(e, KeyboardInterrupt):
+                abort_xet_session()
+            raise
+        if final:
+            self.fs.invalidate_cache(path=self.resolved_path.unresolve())
 
     def _upload_chunk(self, final: bool = False) -> None:
         self.buffer.seek(0)
         block = self.buffer.read()
+        if self._xet_stream is not None:
+            return self._upload_chunk_to_xet_stream(block, final)
         self.temp_file.write(block)
         if final:
             self.temp_file.close()
