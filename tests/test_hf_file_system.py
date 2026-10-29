@@ -894,6 +894,17 @@ def test_stream_file_open_if_not_found():
             HfFileSystemStreamFile(fs, "hf://missing/repo/not_existing_file.txt")
 
 
+@pytest.mark.parametrize("mode", ["wb", "xb", "x"])
+def test_stream_file_rejects_write_modes(mode):
+    # Regression test: writing in streaming mode (block_size=0) must raise instead of silently dropping the data
+    fs = HfFileSystem()
+    with mock_repo_info(fs), patch.object(fs._api, "upload_file") as mock_upload_file:
+        with pytest.raises(ValueError, match="only supports reading"):
+            with fs.open("username/my_model/file.txt", mode=mode, block_size=0):
+                pass
+    mock_upload_file.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("not_supported_path", "expected_error"),
     [
